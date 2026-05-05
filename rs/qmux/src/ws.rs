@@ -40,30 +40,18 @@ fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
     (Version::WebTransport, None)
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a client-side session.
+/// Wrap a pre-upgraded WebSocket connection as a session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework. Pass the negotiated `sec-websocket-protocol`
-/// header value (or `None` to default to the WebTransport wire format).
-pub fn connect<T>(ws: T, alpn: Option<&str>) -> Session
-where
-    T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
-        + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
-        + Unpin
-        + Send
-        + 'static,
-{
-    let (version, protocol) = parse_alpn(alpn);
-    let transport = WsTransport::new(ws);
-    Session::connect(transport, Config::new(version, protocol))
+/// external framework (e.g. axum). Set the negotiated
+/// `sec-websocket-protocol` header value with [`Bare::with_alpn`];
+/// without it, the WebTransport wire format is used.
+pub struct Bare<T> {
+    ws: T,
+    alpn: Option<String>,
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a server-side session.
-///
-/// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). Pass the negotiated `sec-websocket-protocol`
-/// header value (or `None` to default to the WebTransport wire format).
-pub fn accept<T>(ws: T, alpn: Option<&str>) -> Session
+impl<T> Bare<T>
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -71,9 +59,29 @@ where
         + Send
         + 'static,
 {
-    let (version, protocol) = parse_alpn(alpn);
-    let transport = WsTransport::new(ws);
-    Session::accept(transport, Config::new(version, protocol))
+    pub fn new(ws: T) -> Self {
+        Self { ws, alpn: None }
+    }
+
+    /// Set the negotiated `sec-websocket-protocol` value from the handshake.
+    pub fn with_alpn(mut self, alpn: &str) -> Self {
+        self.alpn = Some(alpn.to_string());
+        self
+    }
+
+    /// Wrap as a client-side session.
+    pub fn connect(self) -> Session {
+        let (version, protocol) = parse_alpn(self.alpn.as_deref());
+        let transport = WsTransport::new(self.ws);
+        Session::connect(transport, Config::new(version, protocol))
+    }
+
+    /// Wrap as a server-side session.
+    pub fn accept(self) -> Session {
+        let (version, protocol) = parse_alpn(self.alpn.as_deref());
+        let transport = WsTransport::new(self.ws);
+        Session::accept(transport, Config::new(version, protocol))
+    }
 }
 
 /// A QMux client that connects over WebSocket.
