@@ -349,7 +349,7 @@ wheels = [
 ]
 
 [[package]]
-name = "web-transport-quinn"
+name = "web-transport"
 version = "0.1.1"
 source = { editable = "." }
 dependencies = [
