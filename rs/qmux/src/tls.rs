@@ -6,42 +6,36 @@ use tokio_rustls::TlsConnector;
 use crate::transport::StreamTransport;
 use crate::{alpn, Config, Error, Session, Version};
 
-/// Parse a TLS ALPN into a version and app protocol.
+/// Extract the application protocol from a TLS ALPN, given the pinned version.
 ///
-/// Strips the qmux/webtransport prefix (e.g. `qmux-00.moqt-16` → `moqt-16`).
-/// TLS always uses the QMux wire format regardless of prefix.
-fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
-    let alpn = match alpn {
-        Some(s) if !s.is_empty() => s,
-        _ => return (Version::QMux00, None),
-    };
-
-    for &known in crate::ALPNS {
-        if alpn == known {
-            return (Version::QMux00, None);
-        }
-        if let Some(proto) = alpn.strip_prefix(&format!("{known}.")) {
-            if !proto.is_empty() {
-                return (Version::QMux00, Some(proto.to_string()));
-            }
-        }
+/// The QMux version is set by the caller; this function only strips the
+/// expected prefix to recover the app protocol. Returns `None` for the bare
+/// version ALPN or for unrecognised values.
+fn parse_protocol(alpn: Option<&str>, version: Version) -> Option<String> {
+    let alpn = alpn.filter(|s| !s.is_empty())?;
+    if alpn == version.alpn() {
+        return None;
     }
-
-    tracing::warn!(?alpn, "unrecognized TLS ALPN");
-    (Version::QMux00, None)
+    let Some(proto) = alpn.strip_prefix(version.prefix()) else {
+        tracing::warn!(?alpn, ?version, "unrecognized TLS ALPN");
+        return None;
+    };
+    (!proto.is_empty()).then(|| proto.to_string())
 }
 
-/// Connect over TLS. Always uses the QMux wire format.
+/// Connect over TLS pinned to a specific QMux version.
 ///
-/// The caller's `alpn_protocols` are treated as application-level protocols
-/// and automatically wrapped with `qmux-00.` and `webtransport.` prefixes.
-/// The prefix is stripped from the negotiated result.
+/// The caller's `alpn_protocols` are treated as bare application-level
+/// protocols and wrapped with `{version.prefix()}` before offer. The prefix
+/// is stripped from the negotiated result. To advertise multiple QMux
+/// versions, drive separate connection attempts.
 ///
 /// The `server_name` is used for SNI and certificate verification.
 pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
     config: Arc<rustls::ClientConfig>,
+    version: Version,
 ) -> Result<Session, Error> {
     let stream = TcpStream::connect(&addr).await?;
 
@@ -49,13 +43,12 @@ pub async fn connect(
         .map_err(|e| Error::Io(e.to_string()))?
         .to_owned();
 
-    // Convert caller's raw ALPNs to prefixed qmux/webtransport ALPNs.
     let app_protocols: Vec<String> = config
         .alpn_protocols
         .iter()
         .map(|a| String::from_utf8_lossy(a).to_string())
         .collect();
-    let prefixed = alpn::build(&app_protocols);
+    let prefixed = alpn::build(version, &app_protocols);
 
     let mut config = (*config).clone();
     config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -69,19 +62,19 @@ pub async fn connect(
     let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
     tracing::debug!(?negotiated_str, "TLS negotiated ALPN");
 
-    let (version, protocol) = parse_alpn(negotiated_str);
+    let protocol = parse_protocol(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream);
-    Ok(Session::connect(transport, Config::new(version, protocol)))
+    let session_config = Config::new(version, protocol);
+    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    Ok(Session::connect(transport, session_config))
 }
 
-/// Accept a TLS connection. Always uses the QMux wire format.
-///
-/// The ALPN is extracted from the negotiated TLS connection.
+/// Accept a TLS connection pinned to a specific QMux version.
 pub async fn accept(
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
+    version: Version,
 ) -> Result<Session, Error> {
     let acceptor = TlsAcceptor::from(config);
     let tls_stream = acceptor.accept(stream).await?;
@@ -90,9 +83,10 @@ pub async fn accept(
     let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
     tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
 
-    let (version, protocol) = parse_alpn(negotiated_str);
+    let protocol = parse_protocol(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream);
-    Ok(Session::accept(transport, Config::new(version, protocol)))
+    let session_config = Config::new(version, protocol);
+    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    Ok(Session::accept(transport, session_config))
 }

@@ -5,7 +5,7 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{alpn, Config, Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
+use crate::{alpn, Config, Error, Session, Version};
 
 /// Keep-alive configuration for WebSocket transports.
 ///
@@ -41,54 +41,37 @@ impl Default for KeepAlive {
     }
 }
 
-/// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
+/// Extract the application protocol from a negotiated WebSocket subprotocol header.
 ///
-/// Supports both bare ALPNs (`"qmux-00"`, `"webtransport"`) and
-/// prefixed variants (`"qmux-00.moq-03"`, `"webtransport.moq-03"`).
-/// Defaults to `WebTransport` when `None` or empty.
-fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
-    let alpn = match alpn {
-        Some(s) if !s.is_empty() => s,
-        _ => return (Version::WebTransport, None),
-    };
-
-    if let Some(proto) = alpn.strip_prefix(PREFIX_QMUX) {
-        let proto = if proto.is_empty() {
-            None
-        } else {
-            Some(proto.to_string())
-        };
-        return (Version::QMux00, proto);
+/// The QMux version is fixed by the caller via [`Client::new`] / [`Server::new`]
+/// (or [`Upgraded::new`]); this function just strips the expected prefix to recover
+/// the app protocol, if any. Accepts the bare version ALPN (returns `None`) and
+/// the prefixed form `{version.prefix()}{proto}`. Unknown values yield `None`.
+fn parse_protocol(alpn: Option<&str>, version: Version) -> Option<String> {
+    let alpn = alpn.filter(|s| !s.is_empty())?;
+    if alpn == version.alpn() {
+        return None;
     }
-    if alpn == crate::ALPN_QMUX {
-        return (Version::QMux00, None);
-    }
-    if let Some(proto) = alpn.strip_prefix(PREFIX_WEBTRANSPORT) {
-        let proto = if proto.is_empty() {
-            None
-        } else {
-            Some(proto.to_string())
-        };
-        return (Version::WebTransport, proto);
-    }
-
-    // Unknown or bare "webtransport"
-    (Version::WebTransport, None)
+    let proto = alpn.strip_prefix(version.prefix())?;
+    (!proto.is_empty()).then(|| proto.to_string())
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a session.
+/// Wrap an already-upgraded WebSocket as a QMux session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). Set the negotiated
-/// `sec-websocket-protocol` header value with [`Bare::with_alpn`];
-/// without it, the WebTransport wire format is used.
-pub struct Bare<T> {
+/// external framework (e.g. axum) or by caller-driven code that needs to
+/// run its own handshake (e.g. to advertise multiple QMux versions in one
+/// `Sec-WebSocket-Protocol` header). The caller picks the QMux version at
+/// construction; pass the negotiated `sec-websocket-protocol` value with
+/// [`Upgraded::with_alpn`] so the application protocol can be recovered.
+pub struct Upgraded<T> {
     ws: T,
     alpn: Option<String>,
+    version: Version,
     keep_alive: Option<KeepAlive>,
 }
 
-impl<T> Bare<T>
+impl<T> Upgraded<T>
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -96,10 +79,11 @@ where
         + Send
         + 'static,
 {
-    pub fn new(ws: T) -> Self {
+    pub fn new(ws: T, version: Version) -> Self {
         Self {
             ws,
             alpn: None,
+            version,
             keep_alive: None,
         }
     }
@@ -118,13 +102,15 @@ where
 
     /// Wrap as a client-side session.
     pub fn connect(self) -> Session {
-        let (version, protocol) = parse_alpn(self.alpn.as_deref());
+        let protocol = parse_protocol(self.alpn.as_deref(), self.version);
+        let version = self.version;
         Session::connect(self.into_transport(), Config::new(version, protocol))
     }
 
     /// Wrap as a server-side session.
     pub fn accept(self) -> Session {
-        let (version, protocol) = parse_alpn(self.alpn.as_deref());
+        let protocol = parse_protocol(self.alpn.as_deref(), self.version);
+        let version = self.version;
         Session::accept(self.into_transport(), Config::new(version, protocol))
     }
 
@@ -139,10 +125,14 @@ where
 
 /// A QMux client that connects over WebSocket.
 ///
-/// Supports both `webtransport.` and `qmux-00.` subprotocol prefixes,
-/// preferring QMux when both are available.
-#[derive(Default, Clone)]
+/// The QMux version is fixed at construction. The client advertises the bare
+/// version ALPN plus each configured application protocol prefixed by
+/// `{version.prefix()}`. Callers that want to negotiate multiple QMux versions
+/// (e.g. as a fallback) should drive separate connection attempts; this crate
+/// does not cross-product versions on its own.
+#[derive(Clone)]
 pub struct Client {
+    version: Version,
     protocols: Vec<String>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
     keep_alive: Option<KeepAlive>,
@@ -151,8 +141,16 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a client pinned to a specific QMux version.
+    pub fn new(version: Version) -> Self {
+        Self {
+            version,
+            protocols: Vec::new(),
+            config: None,
+            keep_alive: None,
+            #[cfg(feature = "wss")]
+            connector: None,
+        }
     }
 
     /// Add a supported application-level subprotocol for negotiation.
@@ -202,8 +200,7 @@ impl Client {
             .into_client_request()
             .map_err(|e| Error::Io(e.to_string()))?;
 
-        // Offer both prefix families, preferring qmux-00
-        let protocol_value = alpn::build(&self.protocols).join(", ");
+        let protocol_value = alpn::build(self.version, &self.protocols).join(", ");
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
@@ -229,35 +226,44 @@ impl Client {
                 .await
                 .map_err(|e| Error::Io(e.to_string()))?;
 
-        // Determine version and protocol from response
         let negotiated = response
             .headers()
             .get(http::header::SEC_WEBSOCKET_PROTOCOL)
             .and_then(|h| h.to_str().ok());
 
-        let (version, protocol) = parse_alpn(negotiated);
+        let protocol = parse_protocol(negotiated, self.version);
 
         let transport = match self.keep_alive {
             Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
             None => WsTransport::new(ws_stream),
         };
-        Ok(Session::connect(transport, Config::new(version, protocol)))
+        Ok(Session::connect(
+            transport,
+            Config::new(self.version, protocol),
+        ))
     }
 }
 
 /// A QMux server that accepts WebSocket connections.
 ///
-/// Supports both `webtransport.` and `qmux-00.` subprotocol prefixes,
-/// preferring QMux when both are available.
-#[derive(Default, Clone)]
+/// The QMux version is fixed at construction. Only ALPNs matching this version
+/// are accepted. To support multiple QMux versions on the same port, run more
+/// than one Server instance.
+#[derive(Clone)]
 pub struct Server {
+    version: Version,
     protocols: Vec<String>,
     keep_alive: Option<KeepAlive>,
 }
 
 impl Server {
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a server pinned to a specific QMux version.
+    pub fn new(version: Version) -> Self {
+        Self {
+            version,
+            protocols: Vec::new(),
+            keep_alive: None,
+        }
     }
 
     /// Add a supported application-level subprotocol for negotiation.
@@ -294,9 +300,12 @@ impl Server {
             validate_protocol(p)?;
         }
 
-        let negotiated = Arc::new(Mutex::new(None::<(Version, Option<String>)>));
+        let negotiated = Arc::new(Mutex::new(None::<Option<String>>));
         let negotiated_clone = negotiated.clone();
         let supported = self.protocols.clone();
+        let version = self.version;
+        let prefix = version.prefix();
+        let bare_alpn = version.alpn();
 
         #[allow(clippy::result_large_err)]
         let callback = move |req: &server::Request,
@@ -312,58 +321,30 @@ impl Server {
                 .filter(|p| !p.is_empty())
                 .collect();
 
-            // Try qmux-00 prefix first
-            let qmux_match = header_protocols
+            // Try prefixed protocol match first.
+            if let Some(proto) = header_protocols
                 .iter()
-                .filter_map(|p| p.strip_prefix(PREFIX_QMUX))
+                .filter_map(|p| p.strip_prefix(prefix))
                 .find(|p| supported.iter().any(|s| s == p))
-                .map(|p| p.to_string());
-
-            if let Some(ref proto) = qmux_match {
-                let response_value = format!("{PREFIX_QMUX}{proto}");
+                .map(|p| p.to_string())
+            {
+                let response_value = format!("{prefix}{proto}");
                 response.headers_mut().insert(
                     http::header::SEC_WEBSOCKET_PROTOCOL,
                     http::HeaderValue::from_str(&response_value).unwrap(),
                 );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux00, Some(proto.clone())));
+                *negotiated_clone.lock().unwrap() = Some(Some(proto));
                 return Ok(response);
             }
 
-            // Accept bare qmux-00 only when no specific protocols are configured.
-            if supported.is_empty() && header_protocols.contains(&crate::ALPN_QMUX) {
+            // Fallback: accept the bare version ALPN only when no specific
+            // protocols are configured.
+            if supported.is_empty() && header_protocols.contains(&bare_alpn) {
                 response.headers_mut().insert(
                     http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(crate::ALPN_QMUX).unwrap(),
+                    http::HeaderValue::from_str(bare_alpn).unwrap(),
                 );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux00, None));
-                return Ok(response);
-            }
-
-            // Fall back to webtransport prefix
-            let wt_match = header_protocols
-                .iter()
-                .filter_map(|p| p.strip_prefix(PREFIX_WEBTRANSPORT))
-                .find(|p| supported.iter().any(|s| s == p))
-                .map(|p| p.to_string());
-
-            if let Some(ref proto) = wt_match {
-                let response_value = format!("{PREFIX_WEBTRANSPORT}{proto}");
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(&response_value).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() =
-                    Some((Version::WebTransport, Some(proto.clone())));
-                return Ok(response);
-            }
-
-            // Check for bare webtransport only when no specific protocols are configured.
-            if supported.is_empty() && header_protocols.contains(&crate::ALPN_WEBTRANSPORT) {
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(crate::ALPN_WEBTRANSPORT).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::WebTransport, None));
+                *negotiated_clone.lock().unwrap() = Some(None);
                 return Ok(response);
             }
 
@@ -375,7 +356,7 @@ impl Server {
 
         let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
 
-        let (version, protocol) = negotiated
+        let protocol = negotiated
             .lock()
             .unwrap()
             .take()
@@ -385,6 +366,9 @@ impl Server {
             Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
             None => WsTransport::new(ws),
         };
-        Ok(Session::accept(transport, Config::new(version, protocol)))
+        Ok(Session::accept(
+            transport,
+            Config::new(self.version, protocol),
+        ))
     }
 }

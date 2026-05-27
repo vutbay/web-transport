@@ -1,7 +1,7 @@
 import { Credit } from "./credit.ts";
 import type { TransportParams, Version } from "./frame.ts";
 import * as Frame from "./frame.ts";
-import { DEFAULT_TRANSPORT_PARAMS, MAX_FRAME_PAYLOAD } from "./frame.ts";
+import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
@@ -19,6 +19,10 @@ export interface Config {
 	maxStreamDataBidiRemote?: bigint;
 	/** Per-stream receive window for uni streams. */
 	maxStreamDataUni?: bigint;
+	/** Idle timeout in milliseconds (0 = disabled). */
+	maxIdleTimeout?: bigint;
+	/** Maximum QMux Record size in bytes (draft-01). */
+	maxRecordSize?: bigint;
 }
 
 const DEFAULT_CONFIG: Required<Config> = {
@@ -28,16 +32,20 @@ const DEFAULT_CONFIG: Required<Config> = {
 	maxStreamDataBidiLocal: 262_144n,
 	maxStreamDataBidiRemote: 262_144n,
 	maxStreamDataUni: 262_144n,
+	maxIdleTimeout: 30_000n,
+	maxRecordSize: Frame.DEFAULT_MAX_RECORD_SIZE,
 };
 
 function configToTransportParams(config: Required<Config>): TransportParams {
 	return {
+		maxIdleTimeout: config.maxIdleTimeout,
 		initialMaxData: config.maxData,
 		initialMaxStreamDataBidiLocal: config.maxStreamDataBidiLocal,
 		initialMaxStreamDataBidiRemote: config.maxStreamDataBidiRemote,
 		initialMaxStreamDataUni: config.maxStreamDataUni,
 		initialMaxStreamsBidi: config.maxStreamsBidi,
 		initialMaxStreamsUni: config.maxStreamsUni,
+		maxRecordSize: config.maxRecordSize,
 	};
 }
 
@@ -64,18 +72,50 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 
 /** Options for the WebTransport-over-WebSocket polyfill. */
 export interface SessionOptions extends WebTransportOptions {
+	/** The QMux wire-format version to use.
+	 *
+	 * The version is fixed at construction. Only the corresponding bare ALPN and
+	 * `{prefix}{proto}` subprotocols are advertised during the WebSocket handshake.
+	 * Callers that want to negotiate across multiple QMux drafts should attempt
+	 * separate `Session` instances per version; this class does not cross-product
+	 * versions on its own.
+	 */
+	version: Version;
+
 	/** Application-level subprotocols to request during the WebSocket handshake.
 	 *
-	 * Each protocol is prefixed with `webtransport.` and `qmux-00.` on the wire.
+	 * Each protocol is offered as `{version.prefix}{proto}` (e.g. `qmux-01.moq-03`).
+	 * The bare version ALPN is also advertised as a fallback.
 	 */
 	protocols?: string[];
 
-	/** QMux flow control configuration. Only used when the QMux wire format is negotiated. */
+	/** QMux flow control configuration. Only used for the QMux wire formats. */
 	config?: Config;
 }
 
-const PREFIX_WEBTRANSPORT = "webtransport.";
-const PREFIX_QMUX = "qmux-00.";
+/** Get the ALPN/subprotocol prefix for a version. */
+function versionPrefix(version: Version): string {
+	switch (version) {
+		case "qmux-01":
+			return "qmux-01.";
+		case "qmux-00":
+			return "qmux-00.";
+		case "webtransport":
+			return "webtransport.";
+	}
+}
+
+/** Strip the negotiated subprotocol's expected prefix to recover the app protocol.
+ *
+ * The QMux version is already known (caller-supplied at construction); this only
+ * peels off the prefix. Accepts the bare version ALPN (returns "") and the
+ * prefixed form `{version.prefix}{proto}`. Unknown values yield "".
+ */
+function parseProtocol(raw: string, version: Version): string {
+	if (raw === "" || raw === version) return "";
+	const prefix = versionPrefix(version);
+	return raw.startsWith(prefix) ? raw.slice(prefix.length) : "";
+}
 
 /** Per-stream flow control state. */
 interface StreamFlowState {
@@ -97,7 +137,7 @@ export default class Session implements WebTransport {
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
 
-	#version: Version = "webtransport";
+	readonly #version: Version;
 
 	/** The negotiated application-level subprotocol, or empty string if none.
 	 *
@@ -146,39 +186,50 @@ export default class Session implements WebTransport {
 	#recvBiCredit: Credit;
 	#recvUniCredit: Credit;
 
-	constructor(url: string | URL, options?: SessionOptions) {
-		if (options?.requireUnreliable) {
+	// QMux01 idle-timeout tracking (engaged once we've received the peer's params).
+	#lastRecvAt = Date.now();
+	#lastSendAt = Date.now();
+	#nextPingSeq = 0;
+	#idleTimer?: ReturnType<typeof setInterval>;
+
+	constructor(url: string | URL, options: SessionOptions) {
+		if (options.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
 
-		if (options?.serverCertificateHashes) {
+		if (options.serverCertificateHashes) {
 			console.warn("serverCertificateHashes is not supported; trying anyway");
 		}
 
 		url = Session.#convertToWebSocketUrl(url);
 
 		// Merge user config with defaults
-		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
+		this.#config = { ...DEFAULT_CONFIG, ...options.config };
 		this.#ourParams = configToTransportParams(this.#config);
 
-		// Offer both qmux-00 and webtransport prefixed protocols, preferring qmux-00
-		const appProtocols = options?.protocols ?? [];
-		const prefixed = new Set<string>(["qmux-00", "webtransport"]);
-		for (const p of appProtocols) {
-			const stripped = p.startsWith(PREFIX_WEBTRANSPORT)
-				? p.slice(PREFIX_WEBTRANSPORT.length)
-				: p.startsWith(PREFIX_QMUX)
-					? p.slice(PREFIX_QMUX.length)
-					: p;
-			prefixed.add(`${PREFIX_QMUX}${stripped}`);
-			prefixed.add(`${PREFIX_WEBTRANSPORT}${stripped}`);
+		// The version is pinned at construction. Build the subprotocol list with
+		// only this version's bare ALPN + prefixed application protocols — no
+		// cross-product. Callers that need fallback across versions instantiate
+		// separate Sessions per version themselves.
+		this.#version = options.version;
+		const prefix = versionPrefix(this.#version);
+		const subprotocols: string[] = [this.#version];
+		for (const p of options.protocols ?? []) {
+			subprotocols.push(`${prefix}${p}`);
 		}
-		this.#ws = new WebSocket(url, [...prefixed]);
+		this.#ws = new WebSocket(url, subprotocols);
 
-		// Initialize credits — will be adjusted when version is detected
-		this.#connCredit = new Credit(0n);
-		this.#bidiStreamCredit = new Credit(0n);
-		this.#uniStreamCredit = new Credit(0n);
+		// Initialize credits up front — version is known immediately.
+		if (isQmux(this.#version)) {
+			this.#connCredit = new Credit(0n);
+			this.#bidiStreamCredit = new Credit(0n);
+			this.#uniStreamCredit = new Credit(0n);
+		} else {
+			// No flow control for WebTransport — set unlimited.
+			this.#connCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+			this.#bidiStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+			this.#uniStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+		}
 		this.#recvBiCredit = new Credit(this.#config.maxStreamsBidi);
 		this.#recvUniCredit = new Credit(this.#config.maxStreamsUni);
 
@@ -192,30 +243,13 @@ export default class Session implements WebTransport {
 
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
-			// Detect version from the negotiated subprotocol
-			const raw = this.#ws.protocol;
-			if (raw.startsWith(PREFIX_QMUX)) {
-				this.#version = "qmux-00";
-				this.#protocol = raw.slice(PREFIX_QMUX.length);
-			} else if (raw.startsWith(PREFIX_WEBTRANSPORT)) {
-				this.#version = "webtransport";
-				this.#protocol = raw.slice(PREFIX_WEBTRANSPORT.length);
-			} else if (raw === "qmux-00") {
-				this.#version = "qmux-00";
-				this.#protocol = "";
-			} else {
-				this.#version = "webtransport";
-				this.#protocol = "";
-			}
+			// Recover the application protocol from the negotiated subprotocol.
+			// The QMux version is fixed; only the app protocol comes off the wire.
+			this.#protocol = parseProtocol(this.#ws.protocol, this.#version);
 
-			if (this.#version === "qmux-00") {
+			if (isQmux(this.#version)) {
 				this.#recvDataMax = this.#ourParams.initialMaxData;
 				this.#sendTransportParameters();
-			} else {
-				// No flow control for WebTransport — set unlimited
-				this.#connCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
-				this.#bidiStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
-				this.#uniStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
 			}
 
 			this.#readyResolve();
@@ -262,10 +296,19 @@ export default class Session implements WebTransport {
 		if (!(event.data instanceof ArrayBuffer)) return;
 
 		const data = new Uint8Array(event.data);
+		this.#lastRecvAt = Date.now();
 		try {
-			const frame = Frame.decode(data, this.#version);
-			if (frame !== null) {
-				this.#recvFrame(frame);
+			if (this.#version === "qmux-01") {
+				// QMux01: each WS message is a record containing one or more frames
+				const frames = Frame.decodeRecord(data);
+				for (const frame of frames) {
+					this.#recvFrame(frame);
+				}
+			} else {
+				const frame = Frame.decode(data, this.#version);
+				if (frame !== null) {
+					this.#recvFrame(frame);
+				}
 			}
 		} catch (error) {
 			console.error("Failed to decode frame:", error);
@@ -308,6 +351,11 @@ export default class Session implements WebTransport {
 			this.#bidiStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_streams_uni") {
 			this.#uniStreamCredit.increaseMax(frame.max);
+		} else if (frame.type === "ping_request") {
+			// Respond to ping requests
+			this.#sendPriorityFrame({ type: "ping_response", sequence: frame.sequence });
+		} else if (frame.type === "ping_response") {
+			// Ping response received, no action needed
 		} else if (
 			frame.type === "data_blocked" ||
 			frame.type === "stream_data_blocked" ||
@@ -334,6 +382,58 @@ export default class Session implements WebTransport {
 			const sendLimit =
 				id.dir === Stream.Dir.Bi ? params.initialMaxStreamDataBidiRemote : params.initialMaxStreamDataUni;
 			flow.sendCredit.increaseMax(sendLimit);
+		}
+
+		this.#startIdleTimerIfEnabled();
+	}
+
+	/** Effective idle timeout in ms, or 0 if disabled.
+	 *
+	 * Per RFC 9000 §10.1, the effective value is `min(our, peer)` of the non-zero advertised values
+	 * (or the single non-zero one). If both are zero, idle timeouts are disabled.
+	 */
+	#effectiveIdleTimeoutMs(): bigint {
+		if (this.#version !== "qmux-01") return 0n;
+		const a = this.#ourParams.maxIdleTimeout;
+		const b = this.#peerParams.maxIdleTimeout;
+		if (a === 0n && b === 0n) return 0n;
+		if (a === 0n) return b;
+		if (b === 0n) return a;
+		return a < b ? a : b;
+	}
+
+	#startIdleTimerIfEnabled() {
+		const timeoutMs = this.#effectiveIdleTimeoutMs();
+		if (timeoutMs === 0n) return;
+		// Poll at a fraction of the timeout — frequent enough to trigger pings on time
+		// but not so frequent it burns CPU on otherwise-quiet sessions.
+		const tickMs = Math.max(50, Number(timeoutMs) / 6);
+		this.#idleTimer = setInterval(() => this.#idleTick(Number(timeoutMs)), tickMs);
+	}
+
+	#idleTick(timeoutMs: number) {
+		if (this.#closed) {
+			if (this.#idleTimer) clearInterval(this.#idleTimer);
+			return;
+		}
+		const now = Date.now();
+		if (now - this.#lastRecvAt > timeoutMs) {
+			// Peer has gone silent past the negotiated limit.
+			this.#closeReason = new Error("idle timeout");
+			this.#ws.close();
+			if (this.#idleTimer) clearInterval(this.#idleTimer);
+			return;
+		}
+		// Keep-alive: nudge the peer when our outbound side has been silent for a third
+		// of the timeout. Any frame counts as activity, so this only fires when truly idle.
+		if (now - this.#lastSendAt > timeoutMs / 3) {
+			const seq = this.#nextPingSeq;
+			this.#nextPingSeq = (this.#nextPingSeq + 1) >>> 0;
+			try {
+				this.#sendPriorityFrame({ type: "ping_request", sequence: BigInt(seq) });
+			} catch {
+				// Best effort — if the send fails, the close path will fire shortly.
+			}
 		}
 	}
 
@@ -372,7 +472,7 @@ export default class Session implements WebTransport {
 	}
 
 	#accountRecv(streamId: bigint, bytes: number): boolean {
-		if (this.#version !== "qmux-00" || bytes === 0) return true;
+		if (!isQmux(this.#version) || bytes === 0) return true;
 
 		const bytesN = BigInt(bytes);
 
@@ -395,7 +495,7 @@ export default class Session implements WebTransport {
 	}
 
 	#accountConsumed(streamId: bigint, bytes: number) {
-		if (this.#version !== "qmux-00" || bytes === 0) return;
+		if (!isQmux(this.#version) || bytes === 0) return;
 
 		// Track connection-level consumed (stable, not reset by per-stream updates)
 		this.#recvDataConsumed += BigInt(bytes);
@@ -452,7 +552,7 @@ export default class Session implements WebTransport {
 
 	/** Replenish stream count credit for a peer-initiated stream and send MAX_STREAMS if needed. */
 	#replenishStreamCredit(dir: Stream.DirType) {
-		if (this.#version !== "qmux-00") return;
+		if (!isQmux(this.#version)) return;
 
 		const credit = dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
 		const newMax = credit.consume(1n);
@@ -501,7 +601,7 @@ export default class Session implements WebTransport {
 			// Validate stream count limits (QMux only)
 			// Per QUIC RFC 9000 §4.6, the limit applies to the stream index.
 			// A peer opening stream index N implicitly opens all streams 0..N.
-			if (this.#version === "qmux-00") {
+			if (isQmux(this.#version)) {
 				const credit = frame.id.dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
 				if (!credit.receiveUpTo(frame.id.index + 1n)) {
 					this.close({ closeCode: 1002, reason: "stream limit exceeded" });
@@ -510,7 +610,7 @@ export default class Session implements WebTransport {
 			}
 
 			// Initialize flow control state for new stream
-			if (this.#version === "qmux-00") {
+			if (isQmux(this.#version)) {
 				const recvMax =
 					frame.id.dir === Stream.Dir.Bi
 						? this.#ourParams.initialMaxStreamDataBidiRemote
@@ -654,14 +754,38 @@ export default class Session implements WebTransport {
 			type: "transport_parameters",
 			params: this.#ourParams,
 		};
-		const encoded = Frame.encode(frame, this.#version);
-		this.#ws.send(encoded);
+		// QMux01 over WebSocket uses the WS message boundary as the implicit record
+		// boundary; no extra size prefix is required.
+		this.#sendBytes(Frame.encode(frame, this.#version));
+	}
+
+	/** Send raw frame bytes, validating against the peer's max_record_size for QMux01. */
+	#sendBytes(bytes: Uint8Array) {
+		if (this.#version === "qmux-01") {
+			// Before the peer's TRANSPORT_PARAMETERS arrive, use the draft-01 default
+			// (16382) so we don't accidentally send something the peer will reject.
+			const limit = this.#paramsReceived ? this.#peerParams.maxRecordSize : Frame.DEFAULT_MAX_RECORD_SIZE;
+			if (BigInt(bytes.byteLength) > limit) {
+				throw new Error(`record exceeds peer max_record_size (${bytes.byteLength} > ${limit})`);
+			}
+		}
+		this.#ws.send(bytes);
+		this.#lastSendAt = Date.now();
 	}
 
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = data.byteLength - offset;
-			const chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
+			// Cap by both the static frame-payload ceiling and the peer's record limit
+			// (qmux-01 only — once params are received). Leave 32 bytes of headroom for
+			// the STREAM frame header (frame type + stream id + length varints).
+			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
+			if (this.#version === "qmux-01" && this.#paramsReceived) {
+				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
+				if (peerLimit > 0) {
+					chunkMax = Math.min(chunkMax, peerLimit);
+				}
+			}
 
 			// Claim flow control credit (stream + connection)
 			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax));
@@ -692,7 +816,7 @@ export default class Session implements WebTransport {
 
 	async #sendStreamData(id: Stream.Id, data: Uint8Array) {
 		const streamId = id.value.value;
-		if (this.#version === "qmux-00") {
+		if (isQmux(this.#version)) {
 			await this.#sendStreamDataWithFlowControl(id, streamId, data);
 		} else {
 			for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
@@ -714,13 +838,11 @@ export default class Session implements WebTransport {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 
-		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(chunk);
+		this.#sendBytes(Frame.encode(frame, this.#version));
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
-		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(chunk);
+		this.#sendBytes(Frame.encode(frame, this.#version));
 	}
 
 	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
@@ -737,7 +859,7 @@ export default class Session implements WebTransport {
 		const streamIdVal = streamId.value.value;
 
 		// Initialize flow control for this stream
-		if (this.#version === "qmux-00") {
+		if (isQmux(this.#version)) {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataBidiRemote),
 				recvMax: this.#ourParams.initialMaxStreamDataBidiLocal,
@@ -813,7 +935,7 @@ export default class Session implements WebTransport {
 		const streamIdVal = streamId.value.value;
 
 		// Initialize flow control for this stream
-		if (this.#version === "qmux-00") {
+		if (isQmux(this.#version)) {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataUni),
 				recvMax: 0n,
@@ -862,6 +984,10 @@ export default class Session implements WebTransport {
 	}
 
 	#close(code: number, reason: string) {
+		if (this.#idleTimer) {
+			clearInterval(this.#idleTimer);
+			this.#idleTimer = undefined;
+		}
 		this.#closedResolve({
 			closeCode: code,
 			reason,

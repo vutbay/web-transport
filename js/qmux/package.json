@@ -1,8 +1,8 @@
 {
 	"name": "@moq/qmux",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.0.6",
-	"description": "QMux protocol (draft-ietf-quic-qmux-00) over WebSockets",
+	"version": "0.1.0",
+	"description": "QMux protocol (draft-ietf-quic-qmux-01) over WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": "github:moq-dev/web-transport",
@@ -21,10 +21,11 @@
 		"release": "bun ../common/release.ts"
 	},
 	"devDependencies": {
-		"typescript": "^5.9.2",
-		"rimraf": "^6.0.1",
+		"@types/bun": "^1.3.14",
 		"@types/node": "^24.3.0",
-		"tsx": "^4.20.5"
+		"rimraf": "^6.0.1",
+		"tsx": "^4.20.5",
+		"typescript": "^5.9.2"
 	},
 	"keywords": [
 		"qmux",

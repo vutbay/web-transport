@@ -1,11 +1,11 @@
 [package]
 name = "qmux"
-description = "QMux protocol (draft-ietf-quic-qmux-00) over reliable transports"
+description = "QMux protocol (draft-ietf-quic-qmux-01) over reliable transports"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.0.8"
+version = "0.1.0"
 edition = "2021"
 
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
@@ -35,4 +35,12 @@ web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
+anyhow = "1"
 tokio = { version = "1", features = ["full"] }
+url = "2"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[[example]]
+name = "h3qx"
+required-features = ["tcp"]
