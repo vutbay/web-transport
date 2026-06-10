@@ -14,25 +14,34 @@ bugs — primarily:
   and CONNECT rejection (`/reject/<code>`). The "Aww, Snap! error 11" crash did
   **not** reproduce here — it likely needs a different reject/close shape or a
   different backend than `web-transport-quinn`.
-- **Firefox:** stalls after exactly **2 server-initiated streams** of any type
-  (`server-bi-5`, `server-uni-3`, `server-bi-concurrent-3` all fail;
-  concurrent also arrives **out of order**). Confirmed via server trace
-  (`RUST_LOG=info,quinn_proto=trace`):
-  - `open_bi() returned i=0, i=1` then the server **blocks** in `open_bi().await`
-    — Firefox grants an initial server-initiated stream credit of exactly **2**.
-  - `server-bi-serial/10` (open one, wait for the client to fully close it, then
-    open the next) **passes 10/10** — each open unblocks right after
-    `client closed bidi stream`. So **closing streams replenishes credit.**
-  - `got frame MaxStreams` is received as streams close, but not fast enough to
-    rescue a burst within the timeout.
-  - `client-bi-open-*` / `client-uni-open-*` pass — the limit is specifically on
-    **incoming** (server→client) streams, not client-opened ones.
-  - **Practical fix:** don't open server-initiated streams faster than the peer
-    drains them — cap concurrent server-opened streams to the negotiated
-    `initial_max_streams` (the `server-bi-serial` pattern).
-  - **Open question:** does a burst *eventually* recover or stay stuck forever?
-    Re-run `server-bi-5` in Firefox with the timeout box set to `30000` to tell
-    pacing (recovers) from a Firefox `MAX_STREAMS`-under-burst bug (stuck at 2).
+- **Firefox:** server-initiated streams stall at **2** — but it is **not** a
+  stream-credit problem. Root cause: **`incomingBidirectionalStreams` /
+  `incomingUnidirectionalStreams` backpressure that never resumes.** If the app
+  stops pulling the incoming-streams reader for a moment (e.g. while reading a
+  stream's body), Firefox fills the reader's queue (~2) and then **never delivers
+  any more streams, even after the app resumes pulling.**
+
+  Evidence:
+  - The decisive pair: `server-bi-probe-5` **passes** (it pulls all 5 stream
+    objects back-to-back, *then* reads their bodies), while `server-bi-5`
+    **fails** (it reads each body before pulling the next). Same server, same 5
+    streams — only the pull cadence differs.
+  - Server trace (`RUST_LOG=info,quinn_proto=trace`): Firefox grants
+    `MaxStreams { dir: Bi, count: 102 }`, the server opens **all 5** without
+    blocking (`open_bi() returned i=0..4 elapsed_ms=0`) and writes header+payload
+    to each — then **retransmits streams 2-4 repeatedly** because Firefox never
+    consumes them. The bytes are on the wire; Firefox just doesn't surface the
+    streams to JS.
+  - `server-uni-3` fails the same way with **no echo/writable involved** → rules
+    out the stream's send side; it's purely the incoming-stream reader.
+  - `server-bi-serial/10` passes (server opens one at a time → reader never backs
+    up); `server-mix` 2 uni + 2 bidi passes (per stream-type, ≤ queue);
+    `client-bi-open-*` pass (limit is only on **incoming** streams).
+  - **Workaround (works today):** drain the incoming-streams reader *promptly*
+    into your own queue and process bodies separately — never `await` per-stream
+    work inline between `reader.read()` calls. (This is exactly why the idiomatic
+    `for await (const s of incomingBidirectionalStreams) { await handle(s) }`
+    triggers the bug.)
 
 ## Layout
 
