@@ -28,8 +28,17 @@ This explains the scenarios:
   being driven), then read them → **all 5** delivered.
 - `server-bi-serial-10` — server opens one at a time, never backlogs → **passes**.
 
+## Root cause
+
+Traced to the content-process pull algorithm in
+`dom/webtransport/api/WebTransportStreams.cpp`: the `length > 0` fast path of
+`PullCallbackImpl` returns a pull promise that is never resolved, wedging the
+ReadableStream's pull loop once a backlog forms. Full analysis + suggested fix:
+[`root-cause.md`](root-cause.md).
+
 ## Files
 
+- [`root-cause.md`](root-cause.md) — code-level analysis and proposed patch.
 - [`parent-process.log`](parent-process.log) — `MOZ_LOG=timestamp,nsHttp:5,WebTransport:5`,
   parent process. Shows neqo/HTTP-3 receiving all 5 and forwarding all 5 to content.
 - [`content-process.log`](content-process.log) — `MOZ_LOG=timestamp,WebTransport:5`,
