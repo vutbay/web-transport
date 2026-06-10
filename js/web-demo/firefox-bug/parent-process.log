@@ -1,0 +1,116 @@
+# Firefox MOZ_LOG excerpt (Parent process) — server-bi-5 (server opens 5 server-initiated bidi streams)
+# Modules: nsHttp:5, WebTransport:5.  Run: 2026-06-10 21:46 UTC.
+#
+# CONCLUSION: the parent process receives all 5 incoming streams (neqo/HTTP-3),
+# the DOM WebTransportParent gets all 5 ('IncomingBidirectonalStream available' x5)
+# and forwards all 5 pipes to the content process ('Sending BidirectionalStream pipe to content' x5).
+# Only 2 are ever consumed by content (ReadSegments read=16 + SendFin x2); the other 3 idle
+# until the page's 8s timeout closes the session.  => the cap to 2 is in the CONTENT process
+#    (the JS-facing incomingBidirectionalStreams ReadableStream), downstream of all of this.
+
+21:46:02.221017 Created WebTransportParent 15ce0ba00 https://127.0.0.1:4444/server-bi/5 Dedicated  congestion=Default
+21:46:02.221452 Binding parent endpoint
+21:46:02.221485 WebTransport 15ce0ba00 AsyncConnect
+21:46:02.226829 Http3WebTransportSession ctor 173d7f0e0
+21:46:02.235823 Http3WebTransportSession::OnIncomingWebTransportStream this=173d7f0e0
+21:46:02.235828 Http3WebTransportStream incoming ctor 121428d60
+21:46:02.235840 Http3WebTransportStream::WriteSegments [this=121428d60]
+21:46:02.235846 Http3WebTransportStream::OnWriteSegment [this=121428d60, state=1
+21:46:02.235858 Http3WebTransportStream::WritePipeSegment 121428d60 written=11
+21:46:02.235859 Http3WebTransportStream::OnWriteSegment [this=121428d60, state=2
+21:46:02.235861 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=11 socketin=80470002 [this=121428d60]
+21:46:02.235864 Http3WebTransportSession::OnIncomingWebTransportStream this=173d7f0e0
+21:46:02.235865 Http3WebTransportStream incoming ctor 167768040
+21:46:02.235871 Http3WebTransportStream::WriteSegments [this=167768040]
+21:46:02.235875 Http3WebTransportStream::OnWriteSegment [this=167768040, state=1
+21:46:02.235883 Http3WebTransportStream::WritePipeSegment 167768040 written=11
+21:46:02.235884 Http3WebTransportStream::OnWriteSegment [this=167768040, state=2
+21:46:02.235886 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=11 socketin=80470002 [this=167768040]
+21:46:02.235888 Http3WebTransportSession::OnIncomingWebTransportStream this=173d7f0e0
+21:46:02.235889 Http3WebTransportStream incoming ctor 167768430
+21:46:02.235893 Http3WebTransportStream::WriteSegments [this=167768430]
+21:46:02.235895 Http3WebTransportStream::OnWriteSegment [this=167768430, state=1
+21:46:02.235908 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=0 socketin=80470007 [this=167768430]
+21:46:02.235910 Http3WebTransportStream::WriteSegments [this=167768040]
+21:46:02.235912 Http3WebTransportStream::WriteSegments rv=0x80470002 countWrittenSingle=0 socketin=0 [this=167768040]
+21:46:02.235983 Http3WebTransportSession::OnIncomingWebTransportStream this=173d7f0e0
+21:46:02.235985 Http3WebTransportStream incoming ctor 167768970
+21:46:02.235990 Http3WebTransportStream::WriteSegments [this=167768970]
+21:46:02.235994 Http3WebTransportStream::OnWriteSegment [this=167768970, state=1
+21:46:02.235997 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=0 socketin=80470007 [this=167768970]
+21:46:02.236000 Http3WebTransportStream::WriteSegments [this=167768430]
+21:46:02.236002 Http3WebTransportStream::OnWriteSegment [this=167768430, state=1
+21:46:02.236014 Http3WebTransportStream::WritePipeSegment 167768430 written=11
+21:46:02.236015 Http3WebTransportStream::OnWriteSegment [this=167768430, state=2
+21:46:02.236017 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=11 socketin=80470002 [this=167768430]
+21:46:02.236067 Http3WebTransportSession::OnIncomingWebTransportStream this=173d7f0e0
+21:46:02.236068 Http3WebTransportStream incoming ctor 167768580
+21:46:02.236073 Http3WebTransportStream::WriteSegments [this=167768580]
+21:46:02.236076 Http3WebTransportStream::OnWriteSegment [this=167768580, state=1
+21:46:02.236079 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=0 socketin=80470007 [this=167768580]
+21:46:02.236081 Http3WebTransportStream::WriteSegments [this=167768970]
+21:46:02.236082 Http3WebTransportStream::OnWriteSegment [this=167768970, state=1
+21:46:02.236085 Http3WebTransportStream::WritePipeSegment 167768970 written=11
+21:46:02.236086 Http3WebTransportStream::OnWriteSegment [this=167768970, state=2
+21:46:02.236087 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=11 socketin=80470002 [this=167768970]
+21:46:02.236266 Http3WebTransportStream::WriteSegments [this=167768580]
+21:46:02.236284 Http3WebTransportStream::OnWriteSegment [this=167768580, state=1
+21:46:02.236297 Http3WebTransportStream::WritePipeSegment 167768580 written=11
+21:46:02.236299 Http3WebTransportStream::OnWriteSegment [this=167768580, state=2
+21:46:02.236301 Http3WebTransportStream::WriteSegments rv=0x0 countWrittenSingle=11 socketin=80470002 [this=167768580]
+21:46:02.236613 Created web transport session, sessionID = 0, for 15ce0ba00
+21:46:02.236823 15ce0ba00 IncomingBidirectonalStream available
+21:46:02.236899 15ce0ba00 Sending BidirectionalStream pipe to content
+21:46:02.236954 15ce0ba00 IncomingBidirectonalStream available
+21:46:02.236988 15ce0ba00 Sending BidirectionalStream pipe to content
+21:46:02.237023 15ce0ba00 IncomingBidirectonalStream available
+21:46:02.237057 15ce0ba00 Sending BidirectionalStream pipe to content
+21:46:02.237082 15ce0ba00 IncomingBidirectonalStream available
+21:46:02.237136 15ce0ba00 Sending BidirectionalStream pipe to content
+21:46:02.237175 15ce0ba00 IncomingBidirectonalStream available
+21:46:02.237217 15ce0ba00 Sending BidirectionalStream pipe to content
+21:46:02.237304 WebTransportParent RecvGetMaxDatagramSize
+21:46:02.237317 Max datagram size is 1224
+21:46:02.237418 WebTransportParent Channel ID
+21:46:02.238886 Http3WebTransportStream::OnInputStreamReady [this=121428d60 stream=15cb9b430 state=1]
+21:46:02.238908 Http3WebTransportStream::ReadSegments [this=121428d60]
+21:46:02.238909 Http3WebTransportStream::ReadSegments state=2 [this=121428d60]
+21:46:02.238912 Http3WebTransportStream::OnReadSegment count=16 state=2 [this=121428d60]
+21:46:02.238921 Http3WebTransportStream::OnReadSegment 121428d60 sending body returns error=0x0.
+21:46:02.238922 Http3WebTransportStream::ReadRequestSegment 121428d60 read=16
+21:46:02.238924 Http3WebTransportStream::ReadSegments rv=0x0 read=16 sock-cond=0 again=1 mSendFin=0 [this=121428d60]
+21:46:02.238926 Http3WebTransportStream::ReadSegments state=2 [this=121428d60]
+21:46:02.238927 Http3WebTransportStream::ReadSegments rv=0x0 read=0 sock-cond=0 again=1 mSendFin=0 [this=121428d60]
+21:46:02.238928 Http3WebTransportStream::SendFin [this=121428d60 mSendState=3]
+21:46:02.238964 Http3WebTransportStream::ReadSegments [this=121428d60]
+21:46:02.238965 Http3WebTransportStream::ReadSegments state=3 [this=121428d60]
+21:46:02.239287 Http3WebTransportStream::OnInputStreamReady [this=167768040 stream=15cb9ba60 state=1]
+21:46:02.239298 Http3WebTransportStream::ReadSegments [this=167768040]
+21:46:02.239299 Http3WebTransportStream::ReadSegments state=2 [this=167768040]
+21:46:02.239301 Http3WebTransportStream::OnReadSegment count=16 state=2 [this=167768040]
+21:46:02.239305 Http3WebTransportStream::OnReadSegment 167768040 sending body returns error=0x0.
+21:46:02.239306 Http3WebTransportStream::ReadRequestSegment 167768040 read=16
+21:46:02.239307 Http3WebTransportStream::ReadSegments rv=0x0 read=16 sock-cond=0 again=1 mSendFin=0 [this=167768040]
+21:46:02.239308 Http3WebTransportStream::ReadSegments state=2 [this=167768040]
+21:46:02.239310 Http3WebTransportStream::ReadSegments rv=0x0 read=0 sock-cond=0 again=1 mSendFin=0 [this=167768040]
+21:46:02.239311 Http3WebTransportStream::SendFin [this=167768040 mSendState=3]
+21:46:02.239318 Http3WebTransportStream::ReadSegments [this=167768040]
+21:46:02.239341 Http3WebTransportStream::ReadSegments state=3 [this=167768040]
+21:46:10.239378 Close for 15ce0ba00 received, code = 0, reason = 
+21:46:10.239451 ActorDestroy WebTransportParent 3
+21:46:10.239460 Destroying WebTransportParent 15ce0ba00
+21:46:10.239561 Http3WebTransportSession::Close 173d7f0e0
+21:46:10.239564 Http3Session::CloseWebTransportConn 163296400
+21:46:10.239668 Http3Session::CloseWebTransportStream 163296400 167768430 0x804b00c8
+21:46:10.239671 Http3WebTransportStream::Close [this=167768430]
+21:46:10.239696 Http3WebTransportStream dtor 167768430
+21:46:10.239724 Http3Session::CloseWebTransportStream 163296400 167768970 0x804b00c8
+21:46:10.239726 Http3WebTransportStream::Close [this=167768970]
+21:46:10.239739 Http3WebTransportStream dtor 167768970
+21:46:10.239748 Http3Session::CloseWebTransportStream 163296400 167768580 0x804b00c8
+21:46:10.239750 Http3WebTransportStream::Close [this=167768580]
+21:46:10.239760 Http3WebTransportStream dtor 167768580
+21:46:10.240084 Http3WebTransportStream::Close [this=121428d60]
+21:46:10.240091 Http3WebTransportStream::Close [this=167768040]
+21:46:10.240096 Http3WebTransportStream dtor 121428d60
+21:46:10.240119 Http3WebTransportStream dtor 167768040

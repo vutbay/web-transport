@@ -42,6 +42,11 @@ bugs — primarily:
     work inline between `reader.read()` calls. (This is exactly why the idiomatic
     `for await (const s of incomingBidirectionalStreams) { await handle(s) }`
     triggers the bug.)
+  - **Root cause (Firefox MOZ_LOG):** every layer delivers all 5 streams — neqo,
+    HTTP-3, and the parent→content IPC — but the content-process
+    `IncomingBidirectionalStreams` ReadableStream only enqueues 2: its `Pull`
+    callback fires twice and is never re-invoked from the backlog. Full trace in
+    [`firefox-bug/`](firefox-bug/README.md).
 
 ## Layout
 

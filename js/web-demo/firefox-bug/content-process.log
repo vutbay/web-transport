@@ -1,0 +1,37 @@
+# Firefox MOZ_LOG excerpt (CONTENT process) — server-bi-5
+# MOZ_LOG=timestamp,WebTransport:5  /  file: wtlog.child-7.moz_log  /  2026-06-10 21:50 UTC
+#
+# DEFECT: all 5 incoming bidi streams reach the content process (NewBidirectionalStream x5)
+# and pile into the internal backlog (NotifyIncomingStream counter -> 4), but the
+# IncomingBidirectionalStreams ReadableStream 'Pull' callback fires only twice => only 2
+# streams enqueued to JS. Pull is never invoked again despite a non-empty backlog and the
+# app continuing to read. => incoming-streams ReadableStream does not re-pull from backlog.
+
+21:50:46.858875 Creating WebTransport for https://127.0.0.1:4444/server-bi/5
+21:50:46.858877 Creating WebTransport 112ab9120
+21:50:46.858908 Created datagram streams
+21:50:46.858922 Connecting WebTransport to parent for https://127.0.0.1:4444/server-bi/5
+21:50:46.869561 isreject: 0 nsresult <p>
+21:50:46.869563 Resolved Connection 112ab9120, reliability = 2
+21:50:46.869571 Setting child in datagrams
+21:50:46.869648 IncomingBiDirectionalStreams Pull waiting for a stream
+21:50:46.869676 NewBidirectionalStream()
+21:50:46.869677 NotifyIncomingStream
+21:50:46.869678 NotifyIncomingStream: 1 Bidirectional 
+21:50:46.869682 IncomingBiDirectionalStreams Pull building a stream
+21:50:46.869701 Enqueuing bidirectional stream
+21:50:46.869744 NewBidirectionalStream()
+21:50:46.869745 NotifyIncomingStream
+21:50:46.869746 NotifyIncomingStream: 1 Bidirectional 
+21:50:46.869757 NewBidirectionalStream()
+21:50:46.869758 NotifyIncomingStream
+21:50:46.869758 NotifyIncomingStream: 2 Bidirectional 
+21:50:46.869762 NewBidirectionalStream()
+21:50:46.869763 NotifyIncomingStream
+21:50:46.869763 NotifyIncomingStream: 3 Bidirectional 
+21:50:46.869810 NewBidirectionalStream()
+21:50:46.869814 NotifyIncomingStream
+21:50:46.869815 NotifyIncomingStream: 4 Bidirectional 
+21:50:46.870122 max datagram size for the session is 1224
+21:50:46.870238 IncomingBiDirectionalStreams Pull building a stream
+21:50:46.870253 Enqueuing bidirectional stream
