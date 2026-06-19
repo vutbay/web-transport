@@ -172,6 +172,10 @@ const QX_PING_REQUEST = 0x348c67529ef8c7bdn;
 const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
 // max_record_size transport parameter ID
 const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
+// application_protocols transport parameter ID (QMux-specific, non-TLS ALPN).
+// This implementation only runs over WebSocket, which negotiates the protocol
+// via its subprotocol (ALPN), so receiving this parameter is a protocol error.
+const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
 
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
@@ -414,6 +418,13 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 
 		const paramData = buffer.slice(0, len);
 		buffer = buffer.slice(len);
+
+		// In-band ALPN negotiation is only valid on transports without their own
+		// (TCP, Unix sockets). This implementation only runs over WebSocket, which
+		// negotiates via its subprotocol, so the parameter must never appear.
+		if (id === APPLICATION_PROTOCOLS_ID) {
+			throw new Error("unexpected application_protocols parameter over WebSocket");
+		}
 
 		if (paramData.byteLength < 1) {
 			continue; // Empty param, skip

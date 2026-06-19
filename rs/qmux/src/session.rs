@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map, HashMap},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::config::Config;
@@ -33,6 +33,13 @@ pub struct Session {
 
     closed: watch::Sender<Option<Error>>,
 
+    // Negotiated application protocol (via the application_protocols transport
+    // parameter). `None` inside the OnceLock means "no protocol"; the OnceLock
+    // being unset means negotiation is still pending. `negotiated_ready` flips
+    // to `true` once it's set, so `negotiated()` can await it.
+    negotiated: Arc<OnceLock<Option<String>>>,
+    negotiated_ready: watch::Receiver<bool>,
+
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
     open_uni_credit: Credit,
@@ -62,6 +69,10 @@ struct SessionState<T: Transport> {
     recv_streams: HashMap<StreamId, RecvState>,
 
     closed: watch::Sender<Option<Error>>,
+
+    // Negotiated application protocol — see the matching fields on `Session`.
+    negotiated: Arc<OnceLock<Option<String>>>,
+    negotiated_ready: watch::Sender<bool>,
 
     // Flow control state
     conn_send_credit: Credit,
@@ -463,12 +474,39 @@ impl<T: Transport> SessionState<T> {
         Ok(())
     }
 
+    /// Record the negotiated application protocol exactly once and wake any
+    /// `Session::negotiated()` waiters. Later calls are no-ops.
+    fn resolve_negotiated(&self, protocol: Option<String>) {
+        if self.negotiated.set(protocol).is_ok() {
+            self.negotiated_ready.send_replace(true);
+        }
+    }
+
     fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
         if self.params_received {
             // Duplicate transport parameters
             return Err(Error::FlowControlError);
         }
         self.params_received = true;
+
+        // Resolve / validate the application protocol now the peer's offer is known.
+        match &self.config.protocol {
+            // In-band negotiation: pick the agreed protocol (server preference
+            // wins, matching RFC 7301). The OnceLock is still pending here.
+            crate::Protocol::Negotiate(ours) => {
+                let agreed = negotiate_protocol(self.is_server, ours, &params.protocols);
+                self.resolve_negotiated(agreed);
+            }
+            // Not negotiating in-band: the peer MUST NOT send the parameter.
+            // TLS/WebSocket already chose a protocol via ALPN, and a session
+            // that didn't opt in has no way to interpret it — either way it's a
+            // protocol error. (The OnceLock was resolved eagerly at construction.)
+            crate::Protocol::None | crate::Protocol::Negotiated(_) => {
+                if !params.protocols.is_empty() {
+                    return Err(Error::UnexpectedProtocols);
+                }
+            }
+        }
 
         // Set connection-level send credit from peer's initial_max_data
         self.conn_send_credit
@@ -519,6 +557,28 @@ impl Session {
         Self::new(transport, true, config)
     }
 
+    /// Wait for the negotiated application protocol.
+    ///
+    /// For [`Protocol::Negotiated`](crate::Protocol::Negotiated) /
+    /// [`Protocol::None`](crate::Protocol::None) (e.g. TLS/WS ALPN) this resolves
+    /// immediately. For [`Protocol::Negotiate`](crate::Protocol::Negotiate) — the
+    /// in-band path over TCP, Unix sockets, or any
+    /// [`Stream`](crate::transport::Stream)-based session — it resolves once the
+    /// peer's transport parameters arrive, or to `None` if the connection closes
+    /// first.
+    ///
+    /// [`Session::protocol`](web_transport_trait::Session::protocol) returns the
+    /// same value synchronously, but yields `None` until negotiation completes.
+    pub async fn negotiated(&self) -> Option<String> {
+        if self.negotiated.get().is_none() {
+            // `wait_for` checks the current value first, so this can't miss the
+            // transition even if it already happened.
+            let mut ready = self.negotiated_ready.clone();
+            ready.wait_for(|&done| done).await.ok();
+        }
+        self.negotiated.get().cloned().flatten()
+    }
+
     fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
         let version = config.version;
         let our_params = config.to_transport_params();
@@ -533,6 +593,22 @@ impl Session {
         let (outbound_priority_tx, outbound_priority_rx) = mpsc::unbounded_channel();
 
         let closed = watch::Sender::new(None);
+
+        // Protocol negotiation. Only `Negotiate` resolves in-band (once the
+        // peer's params arrive); the out-of-band cases resolve immediately.
+        let negotiated: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
+        let (negotiated_ready_tx, negotiated_ready_rx) = watch::channel(false);
+        match &config.protocol {
+            crate::Protocol::Negotiate(_) => {} // pending
+            crate::Protocol::Negotiated(name) => {
+                negotiated.set(Some(name.clone())).ok();
+                negotiated_ready_tx.send_replace(true);
+            }
+            crate::Protocol::None => {
+                negotiated.set(None).ok();
+                negotiated_ready_tx.send_replace(true);
+            }
+        }
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
         let open_uni_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -570,6 +646,8 @@ impl Session {
             send_streams: HashMap::new(),
             recv_streams: HashMap::new(),
             closed: closed.clone(),
+            negotiated: negotiated.clone(),
+            negotiated_ready: negotiated_ready_tx,
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
             our_params: our_params.clone(),
@@ -585,6 +663,9 @@ impl Session {
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
+            // Unblock any `negotiated()` waiter if the connection died before the
+            // peer's params arrived. No-op for the eagerly-resolved cases.
+            backend.resolve_negotiated(None);
             // Close all credits so blocked claim()/claim_index() calls unblock
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
@@ -609,6 +690,8 @@ impl Session {
             create_uni: create_uni_tx,
             create_bi: create_bi_tx,
             closed,
+            negotiated,
+            negotiated_ready: negotiated_ready_rx,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,
@@ -790,8 +873,25 @@ impl generic::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.config.protocol.as_deref()
+        // The OnceLock holds the resolved protocol (out-of-band cases are set at
+        // construction). `None` here means in-band negotiation is still pending.
+        self.negotiated.get().and_then(|p| p.as_deref())
     }
+}
+
+/// Select the agreed application protocol from two advertised lists.
+///
+/// The server's preference order wins (first server entry the client also
+/// offered), matching RFC 7301 ALPN selection. Both peers compute the same
+/// answer because each knows whether it is the server. Returns `None` when the
+/// lists don't overlap (or either side advertised nothing).
+fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Option<String> {
+    let (server, client) = if is_server {
+        (ours, peers)
+    } else {
+        (peers, ours)
+    };
+    server.iter().find(|p| client.contains(p)).cloned()
 }
 
 struct SendState {
@@ -1203,5 +1303,36 @@ impl generic::RecvStream for RecvStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod negotiate_tests {
+    use super::negotiate_protocol;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn server_preference_wins() {
+        let server = v(&["b", "a"]);
+        let client = v(&["a", "b"]);
+        // Server is the authority, so its order ("b" first) decides.
+        assert_eq!(
+            negotiate_protocol(true, &server, &client).as_deref(),
+            Some("b")
+        );
+        // Same inputs from the client's vantage point must agree.
+        assert_eq!(
+            negotiate_protocol(false, &client, &server).as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn no_overlap_is_none() {
+        assert_eq!(negotiate_protocol(true, &v(&["a"]), &v(&["b"])), None);
+        assert_eq!(negotiate_protocol(true, &v(&["a"]), &[]), None);
     }
 }
