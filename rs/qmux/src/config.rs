@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use crate::proto::{TransportParams, DEFAULT_MAX_RECORD_SIZE};
 use crate::Version;
 
 /// How the application-level protocol is determined for a session.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Protocol {
     /// No application protocol.
     #[default]
@@ -14,8 +17,9 @@ pub enum Protocol {
     /// For transports without ALPN (TCP, Unix sockets). Both peers must opt in:
     /// receiving the parameter while *not* in this mode is a protocol error.
     /// The agreed protocol is surfaced by
-    /// [`Session::protocol`](web_transport_trait::Session::protocol) /
-    /// [`Session::negotiated`](crate::Session::negotiated) once params arrive.
+    /// [`Session::protocol`](web_transport_trait::Session::protocol), resolved
+    /// by the time [`Session::connect`](crate::Session::connect) /
+    /// [`accept`](crate::Session::accept) returns.
     Negotiate(Vec<String>),
 
     /// Already negotiated out of band (TLS / WebSocket ALPN). Reported as-is;
@@ -25,7 +29,13 @@ pub enum Protocol {
 }
 
 /// Configuration for a QMux session.
+///
+/// Construct with [`Config::new`] (or [`Config::negotiated`]) and set the public
+/// fields you need; the struct is `#[non_exhaustive]` so new fields can be added
+/// without breaking callers. For the common transports, prefer the higher-level
+/// [`tcp`](crate::tcp) / [`uds`](crate::uds) builders, which wrap this.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Wire format version.
     pub version: Version,
@@ -57,6 +67,14 @@ pub struct Config {
     pub max_idle_timeout: u64,
     /// Maximum QMux Record size in bytes (draft-01). Default: 16382.
     pub max_record_size: u64,
+
+    /// How long [`Session::connect`](crate::Session::connect) /
+    /// [`accept`](crate::Session::accept) waits for the peer's transport
+    /// parameters before giving up. Bounds the handshake so a peer that completes
+    /// the transport connection but never sends its parameters can't hang
+    /// establishment forever. Default: 10s; a zero duration disables the timeout
+    /// (wait indefinitely).
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -73,6 +91,7 @@ impl Default for Config {
             max_stream_data_uni: 262_144,         // 256 KB
             max_idle_timeout: 30_000,             // 30 seconds
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }

@@ -34,20 +34,20 @@ pub struct Session {
     closed: watch::Sender<Option<Error>>,
 
     // Negotiated application protocol (via the application_protocols transport
-    // parameter). `None` inside the OnceLock means "no protocol"; the OnceLock
-    // being unset means negotiation is still pending. `negotiated_ready` flips
-    // to `true` once it's set, so `negotiated()` can await it.
+    // parameter) and the path the peer advertised (via the `path` parameter).
+    // Both are resolved exactly once, before the session is handed to the caller
+    // (see `established()`), so `protocol()` / `path()` are plain synchronous
+    // getters. `None` inside an OnceLock means "no value"; unset means the peer's
+    // params haven't arrived yet (only observable on a session you constructed
+    // without awaiting `established()`). OnceLocks give the resolved values a
+    // stable address so the getters can hand out `&str` borrows.
     negotiated: Arc<OnceLock<Option<String>>>,
-    negotiated_ready: watch::Receiver<bool>,
-
-    // Path the peer advertised via the `path` transport parameter. `None` inside
-    // the OnceLock means "no path"; the OnceLock being unset means the peer's
-    // params haven't arrived yet. `peer_path_ready` flips to `true` once it's
-    // set, so `path()` can await it. Kept as an OnceLock rather than folded into
-    // a watch so the resolved value has a stable address and `path()` can hand
-    // out a `&str` borrow (as `protocol()` does), instead of cloning.
     peer_path: Arc<OnceLock<Option<String>>>,
-    peer_path_ready: watch::Receiver<bool>,
+
+    // Flips to `true` once the peer's transport parameters have been received and
+    // applied (or eagerly for the param-less `webtransport` format). `established()`
+    // awaits this; if the sender drops first, the connection closed mid-handshake.
+    established: watch::Receiver<bool>,
 
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
@@ -79,13 +79,11 @@ struct SessionState<T: Transport> {
 
     closed: watch::Sender<Option<Error>>,
 
-    // Negotiated application protocol — see the matching fields on `Session`.
+    // Negotiated protocol, peer path, and handshake-complete signal — see the
+    // matching fields on `Session`.
     negotiated: Arc<OnceLock<Option<String>>>,
-    negotiated_ready: watch::Sender<bool>,
-
-    // Peer's advertised path — see the matching fields on `Session`.
     peer_path: Arc<OnceLock<Option<String>>>,
-    peer_path_ready: watch::Sender<bool>,
+    established: watch::Sender<bool>,
 
     // Flow control state
     conn_send_credit: Credit,
@@ -487,23 +485,6 @@ impl<T: Transport> SessionState<T> {
         Ok(())
     }
 
-    /// Record the negotiated application protocol exactly once and wake any
-    /// `Session::negotiated()` waiters. Later calls are no-ops.
-    fn resolve_negotiated(&self, protocol: Option<String>) {
-        if self.negotiated.set(protocol).is_ok() {
-            self.negotiated_ready.send_replace(true);
-        }
-    }
-
-    /// Record the peer's advertised path exactly once and wake any
-    /// `Session::path()` waiters. The first resolution — the peer's params or
-    /// the connection closing — wins; later calls are no-ops.
-    fn resolve_peer_path(&self, path: Option<String>) {
-        if self.peer_path.set(path).is_ok() {
-            self.peer_path_ready.send_replace(true);
-        }
-    }
-
     fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
         if self.params_received {
             // Duplicate transport parameters
@@ -517,7 +498,7 @@ impl<T: Transport> SessionState<T> {
             // wins, matching RFC 7301). The OnceLock is still pending here.
             crate::Protocol::Negotiate(ours) => {
                 let agreed = negotiate_protocol(self.is_server, ours, &params.protocols);
-                self.resolve_negotiated(agreed);
+                self.negotiated.set(agreed).ok();
             }
             // Not negotiating in-band: the peer MUST NOT send the parameter.
             // TLS/WebSocket already chose a protocol via ALPN, and a session
@@ -532,7 +513,7 @@ impl<T: Transport> SessionState<T> {
 
         // Surface the peer's path (if any). Unlike protocols this isn't gated on
         // opt-in: it's optional routing metadata, so an absent param is just None.
-        self.resolve_peer_path(params.path.clone());
+        self.peer_path.set(params.path.clone()).ok();
 
         // Set connection-level send credit from peer's initial_max_data
         self.conn_send_credit
@@ -568,65 +549,98 @@ impl<T: Transport> SessionState<T> {
 
         self.peer_params = params;
 
+        // Handshake complete: `negotiated` and `peer_path` are now set, so unblock
+        // `established()` and let the synchronous getters return their final values.
+        self.established.send_replace(true);
+
         Ok(())
     }
 }
 
 impl Session {
-    /// Create a client-side session over the given transport.
-    pub fn connect<T: Transport>(transport: T, config: Config) -> Self {
-        Self::new(transport, false, config)
+    /// Open a client-side session over the given transport, waiting until it is
+    /// established before returning.
+    ///
+    /// "Established" means the peer's transport parameters have been received and
+    /// applied, so [`protocol`](web_transport_trait::Session::protocol) and
+    /// [`path`](Session::path) return their final values. The legacy
+    /// `webtransport` wire format exchanges no parameters, so it is established
+    /// immediately.
+    ///
+    /// Bounded by [`Config::handshake_timeout`](crate::Config::handshake_timeout):
+    /// if the peer completes the transport handshake but never sends its
+    /// parameters, this returns [`Error::HandshakeTimeout`] rather than hanging;
+    /// a mid-handshake disconnect returns the close reason.
+    pub async fn connect<T: Transport>(transport: T, config: Config) -> Result<Session, Error> {
+        let session = Self::new(transport, false, config);
+        session.established().await?;
+        Ok(session)
     }
 
-    /// Create a server-side session over the given transport.
-    pub fn accept<T: Transport>(transport: T, config: Config) -> Self {
-        Self::new(transport, true, config)
+    /// Open a server-side session over the given transport, waiting until it is
+    /// established before returning. See [`Session::connect`] for the semantics.
+    pub async fn accept<T: Transport>(transport: T, config: Config) -> Result<Session, Error> {
+        let session = Self::new(transport, true, config);
+        session.established().await?;
+        Ok(session)
     }
 
-    /// Wait for the negotiated application protocol.
-    ///
-    /// For [`Protocol::Negotiated`](crate::Protocol::Negotiated) /
-    /// [`Protocol::None`](crate::Protocol::None) (e.g. TLS/WS ALPN) this resolves
-    /// immediately. For [`Protocol::Negotiate`](crate::Protocol::Negotiate) — the
-    /// in-band path over TCP, Unix sockets, or any
-    /// [`Stream`](crate::transport::Stream)-based session — it resolves once the
-    /// peer's transport parameters arrive, or to `None` if the connection closes
-    /// first.
-    ///
-    /// [`Session::protocol`](web_transport_trait::Session::protocol) returns the
-    /// same value synchronously, but yields `None` until negotiation completes.
-    pub async fn negotiated(&self) -> Option<String> {
-        if self.negotiated.get().is_none() {
-            // `wait_for` checks the current value first, so this can't miss the
-            // transition even if it already happened.
-            let mut ready = self.negotiated_ready.clone();
-            ready.wait_for(|&done| done).await.ok();
+    /// Wait until the peer's transport parameters have been received and applied.
+    /// Folded into [`connect`](Session::connect) / [`accept`](Session::accept);
+    /// see those for the timeout and error semantics.
+    async fn established(&self) -> Result<(), Error> {
+        let mut established = self.established.clone();
+        if *established.borrow() {
+            return Ok(());
         }
-        self.negotiated.get().cloned().flatten()
+
+        let wait = established.wait_for(|&done| done);
+        let timeout = self.config.handshake_timeout;
+        // A zero timeout disables the bound (wait indefinitely).
+        let outcome = if timeout.is_zero() {
+            Some(wait.await)
+        } else {
+            tokio::time::timeout(timeout, wait).await.ok()
+        };
+
+        match outcome {
+            // Established.
+            Some(Ok(_)) => Ok(()),
+            // The backend task ended before establishing — surface the close reason.
+            Some(Err(_)) => Err(self.closed.borrow().clone().unwrap_or(Error::Closed)),
+            // Timed out waiting for the peer's parameters: abort the half-open
+            // handshake, notifying the peer, and fail rather than hang.
+            None => {
+                let _ = self.outbound_priority.send(
+                    ConnectionClose {
+                        code: VarInt::from(0u32),
+                        reason: "handshake timeout".to_string(),
+                    }
+                    .into(),
+                );
+                self.closed.send_replace(Some(Error::HandshakeTimeout));
+                Err(Error::HandshakeTimeout)
+            }
+        }
     }
 
     /// The path the peer advertised via the `path` transport parameter.
     ///
     /// For a server this is the resource path the client requested; for a client
-    /// it's whatever the server advertised (usually `None`).
-    ///
-    /// This is async because the value rides in the peer's transport parameters,
-    /// which arrive after the connection is established. It resolves once those
-    /// params arrive (carrying a path or nothing), or to `None` if the connection
-    /// closes first. For the legacy `webtransport` wire format — which exchanges
-    /// no parameters — it resolves to `None` immediately. The returned `&str`
-    /// borrows from the session, mirroring [`protocol`](generic::Session::protocol).
-    pub async fn path(&self) -> Option<&str> {
-        if self.peer_path.get().is_none() {
-            // `wait_for` checks the current value first, so this can't miss the
-            // transition even if it already happened.
-            let mut ready = self.peer_path_ready.clone();
-            ready.wait_for(|&done| done).await.ok();
-        }
+    /// it's whatever the server advertised (usually `None`). Mirrors
+    /// [`protocol`](web_transport_trait::Session::protocol): a synchronous getter
+    /// that returns the resolved value, since [`connect`](Session::connect) /
+    /// [`accept`](Session::accept) only return once the handshake has completed.
+    pub fn path(&self) -> Option<&str> {
         self.peer_path.get().and_then(|p| p.as_deref())
     }
 
-    fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
+    /// Construct a session over the transport and start its run loop, without
+    /// waiting for the handshake. The public entry points are the async
+    /// [`connect`](Session::connect) / [`accept`](Session::accept), which await
+    /// establishment; this is for callers that resolve their protocol out of band
+    /// (e.g. the WebSocket transport, which negotiates via the subprotocol).
+    pub(crate) fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
         let version = config.version;
         let our_params = config.to_transport_params();
 
@@ -644,28 +658,25 @@ impl Session {
         // Protocol negotiation. Only `Negotiate` resolves in-band (once the
         // peer's params arrive); the out-of-band cases resolve immediately.
         let negotiated: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
-        let (negotiated_ready_tx, negotiated_ready_rx) = watch::channel(false);
         match &config.protocol {
             crate::Protocol::Negotiate(_) => {} // pending
             crate::Protocol::Negotiated(name) => {
                 negotiated.set(Some(name.clone())).ok();
-                negotiated_ready_tx.send_replace(true);
             }
             crate::Protocol::None => {
                 negotiated.set(None).ok();
-                negotiated_ready_tx.send_replace(true);
             }
         }
 
-        // Peer path. Resolved once the peer's transport parameters arrive (or the
-        // connection closes). Only QMux versions exchange params; the legacy
-        // `webtransport` format never does, so resolve it to `None` eagerly to
-        // keep `path()` from hanging.
+        // Peer path. Resolved once the peer's transport parameters arrive.
         let peer_path: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
-        let (peer_path_ready_tx, peer_path_ready_rx) = watch::channel(false);
+
+        // Handshake-complete signal. QMux versions flip it once the peer's params
+        // arrive; the legacy `webtransport` format exchanges none, so it (and the
+        // resolved getters) are established eagerly.
+        let (established_tx, established_rx) = watch::channel(!version.is_qmux());
         if !version.is_qmux() {
             peer_path.set(None).ok();
-            peer_path_ready_tx.send_replace(true);
         }
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -705,9 +716,8 @@ impl Session {
             recv_streams: HashMap::new(),
             closed: closed.clone(),
             negotiated: negotiated.clone(),
-            negotiated_ready: negotiated_ready_tx,
             peer_path: peer_path.clone(),
-            peer_path_ready: peer_path_ready_tx,
+            established: established_tx,
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
             our_params: our_params.clone(),
@@ -723,10 +733,10 @@ impl Session {
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
-            // Unblock any `negotiated()` / `path()` waiter if the connection
-            // died before the peer's params arrived. No-op for already-resolved cases.
-            backend.resolve_negotiated(None);
-            backend.resolve_peer_path(None);
+            // Dropping `backend` drops the `established` sender; an `established()`
+            // waiter that was still pending then observes the channel close and
+            // reports this terminal error. The OnceLocks stay unset, so the
+            // synchronous getters report `None` on a never-established session.
             // Close all credits so blocked claim()/claim_index() calls unblock
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
@@ -757,9 +767,8 @@ impl Session {
             create_bi: create_bi_tx,
             closed,
             negotiated,
-            negotiated_ready: negotiated_ready_rx,
             peer_path,
-            peer_path_ready: peer_path_ready_rx,
+            established: established_rx,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,

@@ -57,6 +57,15 @@ impl Config {
         self
     }
 
+    /// Override how long establishment waits for the peer's transport
+    /// parameters before failing with [`Error::HandshakeTimeout`]. Defaults to
+    /// 10s; a zero duration waits indefinitely. See
+    /// [`Config::handshake_timeout`](crate::Config::handshake_timeout).
+    pub fn handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.handshake_timeout = timeout;
+        self
+    }
+
     /// Connect to the socket at `path` and start a client session.
     pub async fn connect(self, path: impl AsRef<Path>) -> Result<Session, Error> {
         let stream = UnixStream::connect(path).await?;
@@ -64,6 +73,11 @@ impl Config {
     }
 
     /// Start a server session over an accepted Unix-socket stream.
+    ///
+    /// This awaits the QMux handshake (the peer's transport parameters), bounded
+    /// by [`handshake_timeout`](Self::handshake_timeout). Drive each connection
+    /// with `tokio::spawn` so a slow or non-cooperative peer can't stall your
+    /// `listener.accept()` loop.
     pub async fn accept(self, stream: UnixStream) -> Result<Session, Error> {
         finish(stream, self.inner, true).await
     }
@@ -74,9 +88,8 @@ async fn finish(
     config: crate::Config,
     is_server: bool,
 ) -> Result<Session, Error> {
-    let session = build_stream_session(stream, config, is_server)?;
-    // Resolve the protocol before returning (instant unless negotiating). The
-    // peer's path, if any, is awaited lazily by the caller via `Session::path`.
-    session.negotiated().await;
-    Ok(session)
+    // `build_stream_session` awaits the peer's transport parameters before
+    // returning, so `protocol()` and `path()` are resolved on the session we hand
+    // back (bounded by the config's handshake timeout).
+    build_stream_session(stream, config, is_server).await
 }
