@@ -15,7 +15,7 @@ categories = ["network-programming", "web-programming"]
 all-features = true
 
 [features]
-default = ["aws-lc-rs"]
+default = ["ring"]
 aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
 ring = ["quinn/rustls-ring", "rustls/ring"]
 
