@@ -5,7 +5,10 @@
 	"description": "A WebSocketStream polyfill: a plain WebSocket wrapped as { readable, writable } streams with backpressure",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
-	"repository": "github:moq-dev/web-transport",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/moq-dev/web-transport.git"
+	},
 	"exports": {
 		".": "./src/index.ts"
 	},
