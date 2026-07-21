@@ -35,6 +35,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
 ] }
 rustls-native-certs = "0.8"
+webpki-roots = "0.26"
 thiserror = "2"
 
 tokio = { version = "1", default-features = false, features = [

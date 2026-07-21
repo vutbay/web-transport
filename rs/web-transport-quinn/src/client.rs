@@ -80,6 +80,13 @@ impl ClientBuilder {
             }
         }
 
+        // Also fold in the webpki (Mozilla) trust anchors. On some platforms — notably Android and
+        // iOS — `rustls-native-certs` returns an EMPTY store, which would reject EVERY server cert
+        // (the connection just fails to build a path to a trusted root). The bundled roots guarantee
+        // the common public CAs (Let's Encrypt / ISRG, DigiCert, …) are trusted regardless of the
+        // platform, so a CA-signed edge works on mobile — matching the GraphQL client's trust model.
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
         let crypto = self
             .builder()
             .with_root_certificates(roots)
